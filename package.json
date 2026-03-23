@@ -1,6 +1,6 @@
 {
   "name": "wechat-channel",
-  "version": "2.0.0",
+  "version": "1.0.0",
   "description": "独立的微信消息库 - 支持消息收发、媒体传输、QR登录",
   "type": "module",
   "main": "dist/index.js",
@@ -28,8 +28,8 @@
     "messaging",
     "bot"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "Ironben",
+  "license": "MIT",
   "engines": {
     "node": ">=18.0.0"
   },
@@ -43,6 +43,10 @@
   },
   "repository": {
     "type": "git",
-    "url": ""
-  }
+    "url": "git+https://github.com/nanbingxyz/wechat-channel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nanbingxyz/wechat-channel/issues"
+  },
+  "homepage": "https://github.com/nanbingxyz/wechat-channel#readme"
 }
