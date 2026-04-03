@@ -22,10 +22,13 @@ import type {
   SendResult,
   LoginOptions,
   LoginResult,
+  ReplyCapability,
+  SessionStatus,
   MessageHandler,
   ErrorHandler,
   LoginHandler,
   LogoutHandler,
+  SessionStatusHandler,
 } from "./types.js";
 import { setStateDir } from "./storage/state-dir.js";
 import {
@@ -41,13 +44,16 @@ import {
 import { loginWithQr } from "./auth/qr-login.js";
 import { MessageReceiver } from "./messaging/receiver.js";
 import { sendText, sendMedia } from "./messaging/sender.js";
-import { getContextToken } from "./messaging/context-token.js";
+import { clearReplyContexts, getReplyCapabilityFromContext } from "./messaging/context-token.js";
+import { deleteSessionStatus, loadSessionStatus, saveSessionStatus } from "./storage/session-status.js";
+import { WeixinClientError, isSessionExpiredError } from "./errors.js";
 
 type ClientEvents = {
   message: MessageHandler;
   error: ErrorHandler;
   login: LoginHandler;
   logout: LogoutHandler;
+  session_status: SessionStatusHandler;
 };
 
 /**
@@ -170,6 +176,11 @@ export class WeixinClient extends EventEmitter {
         cdnBaseUrl: this.options.cdnBaseUrl,
       });
 
+      clearReplyContexts(normalizedId);
+      this.emitSessionStatus(
+        saveSessionStatus(normalizedId, "disconnected"),
+      );
+
       this.emit("login", account);
       this.options.log?.(`Login successful, accountId=${normalizedId}`);
 
@@ -194,6 +205,10 @@ export class WeixinClient extends EventEmitter {
 
     // 停止接收器
     await this.stop(accountId);
+
+    clearReplyContexts(accountId);
+    this.emitSessionStatus(saveSessionStatus(accountId, "disconnected"));
+    deleteSessionStatus(accountId);
 
     // 删除账户数据
     deleteAccount(accountId);
@@ -251,6 +266,10 @@ export class WeixinClient extends EventEmitter {
       this.emit("error", err, aid);
     });
 
+    receiver.onSessionStatus((status) => {
+      this.emitSessionStatus(status);
+    });
+
     this.receivers.set(accountId, receiver);
     await receiver.start();
 
@@ -276,6 +295,33 @@ export class WeixinClient extends EventEmitter {
     return this.receivers.has(accountId);
   }
 
+  getSessionStatus(accountId: string): SessionStatus {
+    this.ensureInit();
+    return loadSessionStatus(accountId);
+  }
+
+  async getReplyCapability(
+    accountId: string,
+    peerId: string,
+  ): Promise<ReplyCapability> {
+    this.ensureInit();
+
+    const account = this.getAccount(accountId);
+    if (!account?.configured || !getAccountToken(accountId)) {
+      return { canReply: false, reason: "not_connected" };
+    }
+
+    const sessionStatus = loadSessionStatus(accountId);
+    if (sessionStatus.status === "session_expired") {
+      return { canReply: false, reason: "session_expired" };
+    }
+    if (sessionStatus.status !== "connected") {
+      return { canReply: false, reason: "not_connected" };
+    }
+
+    return getReplyCapabilityFromContext(accountId, peerId);
+  }
+
   // ---------------------------------------------------------------------------
   // 消息发送
   // ---------------------------------------------------------------------------
@@ -297,35 +343,40 @@ export class WeixinClient extends EventEmitter {
     });
 
     if (!account.configured) {
-      throw new Error(`Account ${accountId} is not configured. Please login first.`);
+      throw new WeixinClientError(
+        "ERR_ACCOUNT_NOT_CONFIGURED",
+        `Account ${accountId} is not configured. Please login first.`,
+      );
     }
 
     const token = getAccountToken(accountId);
     if (!token) {
-      throw new Error(`Account ${accountId} has no token. Please login first.`);
-    }
-
-    // 获取 context token
-    const contextToken = options.contextToken ?? getContextToken(accountId, to);
-    if (!contextToken) {
-      throw new Error(
-        `No context token available for ${to}. You can only reply to received messages.`,
+      throw new WeixinClientError(
+        "ERR_ACCOUNT_TOKEN_MISSING",
+        `Account ${accountId} has no token. Please login first.`,
       );
     }
 
-    return sendText(
-      {
-        accountId,
-        baseUrl: account.baseUrl,
-        cdnBaseUrl: account.cdnBaseUrl,
-        token,
-        log: this.options.log,
-        debugLog: this.options.debugLog,
-      },
-      to,
-      text,
-      { contextToken },
-    );
+    const contextToken = await this.resolveContextTokenForSend(accountId, to, options.contextToken);
+
+    try {
+      return await sendText(
+        {
+          accountId,
+          baseUrl: account.baseUrl,
+          cdnBaseUrl: account.cdnBaseUrl,
+          token,
+          log: this.options.log,
+          debugLog: this.options.debugLog,
+        },
+        to,
+        text,
+        { contextToken },
+      );
+    } catch (err) {
+      this.handleSendError(accountId, err);
+      throw err;
+    }
   }
 
   /**
@@ -345,35 +396,40 @@ export class WeixinClient extends EventEmitter {
     });
 
     if (!account.configured) {
-      throw new Error(`Account ${accountId} is not configured. Please login first.`);
+      throw new WeixinClientError(
+        "ERR_ACCOUNT_NOT_CONFIGURED",
+        `Account ${accountId} is not configured. Please login first.`,
+      );
     }
 
     const token = getAccountToken(accountId);
     if (!token) {
-      throw new Error(`Account ${accountId} has no token. Please login first.`);
-    }
-
-    // 获取 context token
-    const contextToken = options.contextToken ?? getContextToken(accountId, to);
-    if (!contextToken) {
-      throw new Error(
-        `No context token available for ${to}. You can only reply to received messages.`,
+      throw new WeixinClientError(
+        "ERR_ACCOUNT_TOKEN_MISSING",
+        `Account ${accountId} has no token. Please login first.`,
       );
     }
 
-    return sendMedia(
-      {
-        accountId,
-        baseUrl: account.baseUrl,
-        cdnBaseUrl: account.cdnBaseUrl,
-        token,
-        log: this.options.log,
-        debugLog: this.options.debugLog,
-      },
-      to,
-      mediaPath,
-      { contextToken, text: options.text },
-    );
+    const contextToken = await this.resolveContextTokenForSend(accountId, to, options.contextToken);
+
+    try {
+      return await sendMedia(
+        {
+          accountId,
+          baseUrl: account.baseUrl,
+          cdnBaseUrl: account.cdnBaseUrl,
+          token,
+          log: this.options.log,
+          debugLog: this.options.debugLog,
+        },
+        to,
+        mediaPath,
+        { contextToken, text: options.text },
+      );
+    } catch (err) {
+      this.handleSendError(accountId, err);
+      throw err;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -392,5 +448,80 @@ export class WeixinClient extends EventEmitter {
 
     this.removeAllListeners();
     this.options.log?.("WeixinClient closed");
+  }
+
+  private emitSessionStatus(status: SessionStatus): void {
+    this.emit("session_status", status);
+  }
+
+  private async resolveContextTokenForSend(
+    accountId: string,
+    peerId: string,
+    explicitContextToken?: string,
+  ): Promise<string> {
+    const sessionStatus = loadSessionStatus(accountId);
+    if (sessionStatus.status === "session_expired") {
+      throw new WeixinClientError(
+        "ERR_SESSION_EXPIRED",
+        sessionStatus.errorMessage || "Session expired.",
+        { apiErrorCode: sessionStatus.errorCode },
+      );
+    }
+    if (sessionStatus.status !== "connected") {
+      throw new WeixinClientError(
+        "ERR_NOT_CONNECTED",
+        `Account ${accountId} is not connected.`,
+      );
+    }
+
+    if (explicitContextToken) {
+      return explicitContextToken;
+    }
+
+    const capability = await this.getReplyCapability(accountId, peerId);
+    if (capability.canReply && capability.contextToken) {
+      return capability.contextToken;
+    }
+
+    switch (capability.reason) {
+      case "session_expired":
+        throw new WeixinClientError(
+          "ERR_SESSION_EXPIRED",
+          "Session expired.",
+        );
+      case "not_connected":
+        throw new WeixinClientError(
+          "ERR_NOT_CONNECTED",
+          `Account ${accountId} is not connected.`,
+        );
+      case "expired":
+        throw new WeixinClientError(
+          "ERR_CONTEXT_TOKEN_EXPIRED",
+          `Context token for ${peerId} has expired. You can only reply within 24 hours of the last inbound message.`,
+          { details: capability },
+        );
+      case "missing_context":
+      default:
+        throw new WeixinClientError(
+          "ERR_CONTEXT_TOKEN_MISSING",
+          `No context token available for ${peerId}. You can only reply to received messages.`,
+          { details: capability },
+        );
+    }
+  }
+
+  private handleSendError(accountId: string, error: unknown): void {
+    if (!isSessionExpiredError(error)) {
+      return;
+    }
+    this.emitSessionStatus(
+      saveSessionStatus(accountId, "session_expired", {
+        errorCode:
+          error instanceof WeixinClientError && typeof error.apiErrorCode === "number"
+            ? error.apiErrorCode
+            : undefined,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }),
+    );
   }
 }

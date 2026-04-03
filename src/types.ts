@@ -90,6 +90,40 @@ export interface WeixinMessage {
   raw?: unknown;
 }
 
+export type ReplyCapabilityReason =
+  | "missing_context"
+  | "expired"
+  | "session_expired"
+  | "not_connected";
+
+export interface ReplyCapability {
+  /** 是否可回复 */
+  canReply: boolean;
+  /** 不可回复原因 */
+  reason?: ReplyCapabilityReason;
+  /** 最近一次收到该会话消息的时间 */
+  lastInboundAt?: number;
+  /** 回复窗口失效时间 */
+  expiresAt?: number;
+  /** 当前可用的 context token */
+  contextToken?: string;
+}
+
+export type SessionState = "connected" | "disconnected" | "session_expired";
+
+export interface SessionStatus {
+  /** 账户 ID */
+  accountId: string;
+  /** 当前会话状态 */
+  status: SessionState;
+  /** 状态变更时间 */
+  changedAt: number;
+  /** 可选协议错误码 */
+  errorCode?: number;
+  /** 可选错误消息 */
+  errorMessage?: string;
+}
+
 export interface WeixinMediaInfo {
   /** 本地文件路径 */
   path: string;
@@ -190,6 +224,7 @@ export type MessageHandler = (message: WeixinMessage) => void | Promise<void>;
 export type ErrorHandler = (error: Error, accountId?: string) => void;
 export type LoginHandler = (account: WeixinAccount) => void | Promise<void>;
 export type LogoutHandler = (accountId: string) => void | Promise<void>;
+export type SessionStatusHandler = (status: SessionStatus) => void | Promise<void>;
 
 // ---------------------------------------------------------------------------
 // 内部类型

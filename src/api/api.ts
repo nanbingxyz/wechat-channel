@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ensureTrailingSlash } from "../util.js";
+import { WeixinClientError, isSessionExpiredPayload } from "../errors.js";
 
 import type {
   BaseInfo,
@@ -110,7 +111,7 @@ async function apiFetch(params: {
   timeoutMs: number;
   label: string;
   debugLog?: (msg: string) => void;
-}): Promise<string> {
+}): Promise<{ ok: boolean; status: number; rawText: string }> {
   const base = ensureTrailingSlash(params.baseUrl);
   const url = new URL(params.endpoint, base);
   const hdrs = buildHeaders({ token: params.token, body: params.body });
@@ -128,14 +129,75 @@ async function apiFetch(params: {
     clearTimeout(t);
     const rawText = await res.text();
     params.debugLog?.(`${params.label} status=${res.status} raw=${redactBody(rawText)}`);
-    if (!res.ok) {
-      throw new Error(`${params.label} ${res.status}: ${rawText}`);
-    }
-    return rawText;
+    return {
+      ok: res.ok,
+      status: res.status,
+      rawText,
+    };
   } catch (err) {
     clearTimeout(t);
     throw err;
   }
+}
+
+function parseJsonBody<T>(rawText: string, label: string): T {
+  if (!rawText.trim()) {
+    return {} as T;
+  }
+  try {
+    return JSON.parse(rawText) as T;
+  } catch (err) {
+    throw new WeixinClientError(
+      "ERR_API_FAILURE",
+      `${label} returned invalid JSON`,
+      { cause: err, details: { rawText } },
+    );
+  }
+}
+
+function throwApiFailure(params: {
+  label: string;
+  status: number;
+  payload?: { errcode?: number; errmsg?: string; ret?: number };
+  rawText: string;
+}): never {
+  const payload = params.payload;
+  const message = payload?.errmsg?.trim() || `${params.label} failed with status ${params.status}`;
+  if (payload && isSessionExpiredPayload(payload)) {
+    throw new WeixinClientError(
+      "ERR_SESSION_EXPIRED",
+      message,
+      {
+        apiErrorCode: payload.errcode,
+        details: { status: params.status, rawText: params.rawText, payload },
+      },
+    );
+  }
+  throw new WeixinClientError(
+    "ERR_API_FAILURE",
+    message,
+    {
+      apiErrorCode: payload?.errcode,
+      details: { status: params.status, rawText: params.rawText, payload },
+    },
+  );
+}
+
+function ensureApiSuccess(
+  label: string,
+  result: { ok: boolean; status: number; rawText: string },
+): { errcode?: number; errmsg?: string; ret?: number } {
+  const payload = parseJsonBody<{ errcode?: number; errmsg?: string; ret?: number }>(
+    result.rawText,
+    label,
+  );
+  if (!result.ok) {
+    throwApiFailure({ label, status: result.status, payload, rawText: result.rawText });
+  }
+  if ((typeof payload.ret === "number" && payload.ret !== 0) || (typeof payload.errcode === "number" && payload.errcode !== 0)) {
+    throwApiFailure({ label, status: result.status, payload, rawText: result.rawText });
+  }
+  return payload;
 }
 
 /**
@@ -166,7 +228,10 @@ export async function getUpdates(
       label: "getUpdates",
       debugLog: params.debugLog,
     });
-    const resp: GetUpdatesResp = JSON.parse(rawText);
+    if (!rawText.ok) {
+      throw new Error(`getUpdates ${rawText.status}: ${rawText.rawText}`);
+    }
+    const resp: GetUpdatesResp = parseJsonBody(rawText.rawText, "getUpdates");
     return resp;
   } catch (err) {
     // Long-poll timeout is normal; return empty response so caller can retry
@@ -182,7 +247,7 @@ export async function getUpdates(
 export async function getUploadUrl(
   params: GetUploadUrlReq & WeixinApiOptions,
 ): Promise<GetUploadUrlResp> {
-  const rawText = await apiFetch({
+    const rawText = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/getuploadurl",
     body: JSON.stringify({
@@ -204,7 +269,10 @@ export async function getUploadUrl(
     label: "getUploadUrl",
     debugLog: params.debugLog,
   });
-  const resp: GetUploadUrlResp = JSON.parse(rawText);
+  if (!rawText.ok) {
+    throw new Error(`getUploadUrl ${rawText.status}: ${rawText.rawText}`);
+  }
+  const resp: GetUploadUrlResp = parseJsonBody(rawText.rawText, "getUploadUrl");
   return resp;
 }
 
@@ -212,7 +280,7 @@ export async function getUploadUrl(
 export async function sendMessage(
   params: WeixinApiOptions & { body: SendMessageReq },
 ): Promise<void> {
-  await apiFetch({
+  const result = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendmessage",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -221,13 +289,14 @@ export async function sendMessage(
     label: "sendMessage",
     debugLog: params.debugLog,
   });
+  ensureApiSuccess("sendMessage", result);
 }
 
 /** Fetch bot config (includes typing_ticket) for a given user. */
 export async function getConfig(
   params: WeixinApiOptions & { ilinkUserId: string; contextToken?: string },
 ): Promise<GetConfigResp> {
-  const rawText = await apiFetch({
+  const result = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/getconfig",
     body: JSON.stringify({
@@ -240,7 +309,8 @@ export async function getConfig(
     label: "getConfig",
     debugLog: params.debugLog,
   });
-  const resp: GetConfigResp = JSON.parse(rawText);
+  ensureApiSuccess("getConfig", result);
+  const resp: GetConfigResp = parseJsonBody(result.rawText, "getConfig");
   return resp;
 }
 
@@ -248,7 +318,7 @@ export async function getConfig(
 export async function sendTyping(
   params: WeixinApiOptions & { body: SendTypingReq },
 ): Promise<void> {
-  await apiFetch({
+  const result = await apiFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendtyping",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -257,4 +327,5 @@ export async function sendTyping(
     label: "sendTyping",
     debugLog: params.debugLog,
   });
+  ensureApiSuccess("sendTyping", result);
 }

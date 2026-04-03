@@ -19,7 +19,7 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "clean": "rm -rf dist",
-    "test": "echo \"No tests yet\" && exit 0",
+    "test": "node --import tsx --test test/**/*.test.ts",
     "example": "tsx examples/basic-usage.ts"
   },
   "keywords": [

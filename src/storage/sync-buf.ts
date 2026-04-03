@@ -6,15 +6,23 @@ import { deriveRawAccountId } from "../util.js";
 import { resolveStateDir } from "./state-dir.js";
 
 function resolveAccountsDir(): string {
-  return path.join(resolveStateDir(), "openclaw-weixin", "accounts");
+  return path.join(resolveStateDir(), "sync-buf");
 }
 
 /**
  * Path to the persistent get_updates_buf file for an account.
- * Stored alongside account data: ~/.openclaw/openclaw-weixin/accounts/{accountId}.sync.json
+ * Stored in: {stateDir}/sync-buf/{accountId}.sync.json
  */
 export function getSyncBufFilePath(accountId: string): string {
   return path.join(resolveAccountsDir(), `${accountId}.sync.json`);
+}
+
+function getReceiverCompatPath(accountId: string): string {
+  return path.join(resolveStateDir(), "sync-buf", `${accountId}.json`);
+}
+
+function getLegacyAccountSyncBufPath(accountId: string): string {
+  return path.join(resolveStateDir(), "openclaw-weixin", "accounts", `${accountId}.sync.json`);
 }
 
 /** Legacy single-account syncbuf (pre multi-account): `.openclaw-weixin-sync/default.json`. */
@@ -36,9 +44,12 @@ export type SyncBufData = {
 function readSyncBufFile(filePath: string): string | undefined {
   try {
     const raw = fs.readFileSync(filePath, "utf-8");
-    const data = JSON.parse(raw) as { get_updates_buf?: string };
+    const data = JSON.parse(raw) as { get_updates_buf?: string; getUpdatesBuf?: string };
     if (typeof data.get_updates_buf === "string") {
       return data.get_updates_buf;
+    }
+    if (typeof data.getUpdatesBuf === "string") {
+      return data.getUpdatesBuf;
     }
   } catch {
     // file not found or invalid
@@ -50,20 +61,27 @@ function readSyncBufFile(filePath: string): string | undefined {
  * Load persisted get_updates_buf.
  * Falls back in order:
  *   1. Primary path (normalized accountId, new installs)
- *   2. Compat path (raw accountId derived from pattern, old installs)
- *   3. Legacy single-account path (very old installs without multi-account support)
+ *   2. Receiver compat path (`sync-buf/{accountId}.json`)
+ *   3. Legacy account path (`openclaw-weixin/accounts/{accountId}.sync.json`)
+ *   4. Compat path using raw accountId derived from pattern
+ *   5. Legacy single-account path (very old installs without multi-account support)
  */
 export function loadGetUpdatesBuf(filePath: string): string | undefined {
   const value = readSyncBufFile(filePath);
   if (value !== undefined) return value;
 
+  const accountId = path.basename(filePath, ".sync.json");
+  const receiverCompatValue = readSyncBufFile(getReceiverCompatPath(accountId));
+  if (receiverCompatValue !== undefined) return receiverCompatValue;
+
+  const legacyValue = readSyncBufFile(getLegacyAccountSyncBufPath(accountId));
+  if (legacyValue !== undefined) return legacyValue;
+
   // Compat: if given path uses a normalized accountId (e.g. "b0f5860fdecb-im-bot.sync.json"),
   // also try the old raw-ID filename (e.g. "b0f5860fdecb@im.bot.sync.json").
-  const accountId = path.basename(filePath, ".sync.json");
   const rawId = deriveRawAccountId(accountId);
   if (rawId) {
-    const compatPath = path.join(resolveAccountsDir(), `${rawId}.sync.json`);
-    const compatValue = readSyncBufFile(compatPath);
+    const compatValue = readSyncBufFile(getLegacyAccountSyncBufPath(rawId));
     if (compatValue !== undefined) return compatValue;
   }
 

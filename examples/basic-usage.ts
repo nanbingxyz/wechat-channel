@@ -40,9 +40,13 @@ async function main() {
     // 回复文本消息
     if (msg.text) {
       try {
-        const result = await client.sendText(msg.accountId, msg.from, `收到: ${msg.text}`, {
-          contextToken: msg.contextToken,
-        });
+        const capability = await client.getReplyCapability(msg.accountId, msg.from);
+        if (!capability.canReply) {
+          console.log(`  当前不可回复: ${capability.reason}`);
+          return;
+        }
+
+        const result = await client.sendText(msg.accountId, msg.from, `收到: ${msg.text}`);
         console.log(`  回复成功: ${result.messageId}`);
       } catch (err) {
         console.error(`  回复失败: ${String(err)}`);
@@ -53,6 +57,10 @@ async function main() {
   // 处理错误
   client.on("error", (err, accountId) => {
     console.error(`账户 ${accountId} 错误: ${err.message}`);
+  });
+
+  client.on("session_status", (status) => {
+    console.log(`会话状态变更: ${status.accountId} -> ${status.status}`);
   });
 
   // 处理登录事件

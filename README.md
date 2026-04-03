@@ -43,10 +43,14 @@ client.on('message', async (msg) => {
   console.log(`收到消息: ${msg.text}`);
   console.log(`来自: ${msg.from}`);
 
-  // 回复消息
-  await client.sendText(msg.accountId, msg.from, '收到！', {
-    contextToken: msg.contextToken,
-  });
+  const capability = await client.getReplyCapability(msg.accountId, msg.from);
+  if (!capability.canReply) {
+    console.log(`当前不可回复: ${capability.reason}`);
+    return;
+  }
+
+  // 回复消息（会自动使用持久化的 contextToken）
+  await client.sendText(msg.accountId, msg.from, '收到！');
 });
 ```
 
@@ -83,18 +87,23 @@ async function main() {
 
     console.log(`${msg.from}: ${msg.text}`);
 
+    const capability = await client.getReplyCapability(msg.accountId, msg.from);
+    if (!capability.canReply) {
+      console.log(`当前不可回复: ${capability.reason}`);
+      return;
+    }
+
     // 简单的 echo 机器人
-    await client.sendText(
-      msg.accountId,
-      msg.from,
-      `你说: ${msg.text}`,
-      { contextToken: msg.contextToken }
-    );
+    await client.sendText(msg.accountId, msg.from, `你说: ${msg.text}`);
   });
 
   // 处理错误
   client.on('error', (err, accountId) => {
     console.error(`账户 ${accountId} 错误:`, err.message);
+  });
+
+  client.on('session_status', (status) => {
+    console.log(`会话状态: ${status.accountId} -> ${status.status}`);
   });
 
   // 检查已有账户
@@ -178,10 +187,24 @@ const result = await client.login({
 await client.sendText(
   accountId,
   toUserId,
-  '你好！',
-  { contextToken: msg.contextToken }
+  '你好！'
 );
 ```
+
+##### `getReplyCapability(accountId, peerId): Promise<ReplyCapability>`
+
+查询当前是否还能对某个用户回复。
+
+```typescript
+const capability = await client.getReplyCapability(accountId, toUserId);
+if (!capability.canReply) {
+  console.log(capability.reason);
+}
+```
+
+##### `getSessionStatus(accountId): SessionStatus`
+
+读取本地持久化的会话状态：`connected`、`disconnected` 或 `session_expired`。
 
 ##### `sendMedia(accountId, to, mediaPath, options?): Promise<SendResult>`
 
@@ -215,6 +238,7 @@ await client.sendMedia(
 | `error` | `Error, accountId?` | 发生错误 |
 | `login` | `WeixinAccount` | 账户登录成功 |
 | `logout` | `accountId: string` | 账户登出 |
+| `session_status` | `SessionStatus` | 会话状态变化 |
 
 ### WeixinMessage
 
@@ -295,17 +319,27 @@ sendMedia → 读取文件 → AES加密 → CDN上传 → 发送消息引用
 
 ```typescript
 client.on('message', async (msg) => {
-  // ✅ 正确：使用消息中的 contextToken
+  const capability = await client.getReplyCapability(accountId, msg.from);
+  if (!capability.canReply) return;
+
+  // ✅ 正确：sendText 会自动使用最近 24 小时内持久化的 contextToken
+  await client.sendText(accountId, msg.from, '回复');
+
+  // 也可以显式覆盖
   await client.sendText(accountId, msg.from, '回复', {
     contextToken: msg.contextToken,
   });
-
-  // ❌ 错误：没有 contextToken 会失败
-  // await client.sendText(accountId, msg.from, '回复');
 });
 ```
 
 **这意味着你只能回复收到的消息，不能主动发送消息给用户。**
+
+`getReplyCapability()` 会返回以下原因之一：
+
+- `missing_context`：从未收到该用户的可回复消息
+- `expired`：最近一次 `contextToken` 已超过 24 小时
+- `session_expired`：会话已经失效
+- `not_connected`：当前账户未连接
 
 ### 数据存储
 
@@ -316,15 +350,20 @@ client.on('message', async (msg) => {
 ├── accounts.json         # 账户索引
 ├── accounts/             # 账户凭证
 │   └── {accountId}.json
+├── reply-context/        # 最近一次可回复上下文
+│   └── {accountId}.json
+├── session-status/       # 会话状态
+│   └── {accountId}.json
 ├── media/                # 下载的媒体文件
 └── sync-buf/             # 同步缓冲
+    └── {accountId}.sync.json
 ```
 
 可通过 `stateDir` 选项自定义目录。
 
 ### 会话过期
 
-长时间不活动后，会话可能过期，需要重新扫码登录。客户端会自动处理会话过期的情况。
+长时间不活动后，会话可能过期。客户端会在本地持久化 `session_expired` 状态，并通过 `session_status` 事件通知上层。
 
 ## 开发
 

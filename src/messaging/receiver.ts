@@ -2,13 +2,21 @@
  * 消息接收器 - 长轮询接收微信消息
  */
 
-import type { WeixinMessage, MessageHandler, ErrorHandler } from "../types.js";
+import type {
+  WeixinMessage,
+  MessageHandler,
+  ErrorHandler,
+  SessionStatus,
+  SessionStatusHandler,
+} from "../types.js";
 import { getUpdates } from "../api/api.js";
-import type { WeixinApiOptions } from "../api/api.js";
 import { MessageItemType } from "../api/types.js";
 import { setContextToken } from "./context-token.js";
 import { downloadMediaFromItem } from "../media/downloader.js";
 import { generateId, sleep } from "../util.js";
+import { getSyncBufFilePath, loadGetUpdatesBuf, saveGetUpdatesBuf } from "../storage/sync-buf.js";
+import { saveSessionStatus } from "../storage/session-status.js";
+import { isSessionExpiredError, isSessionExpiredPayload } from "../errors.js";
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -26,6 +34,7 @@ export interface ReceiverOptions {
   log?: (msg: string) => void;
   errorLog?: (msg: string) => void;
   debugLog?: (msg: string) => void;
+  now?: () => number;
 }
 
 /**
@@ -37,6 +46,7 @@ export class MessageReceiver {
   private isRunning = false;
   private messageHandlers: MessageHandler[] = [];
   private errorHandlers: ErrorHandler[] = [];
+  private sessionStatusHandlers: SessionStatusHandler[] = [];
   private getUpdatesBuf = "";
   private consecutiveFailures = 0;
 
@@ -59,6 +69,13 @@ export class MessageReceiver {
   }
 
   /**
+   * 添加会话状态处理器
+   */
+  onSessionStatus(handler: SessionStatusHandler): void {
+    this.sessionStatusHandlers.push(handler);
+  }
+
+  /**
    * 开始接收消息
    */
   async start(): Promise<void> {
@@ -69,37 +86,53 @@ export class MessageReceiver {
 
     this.isRunning = true;
     this.abortController = new AbortController();
-    this.options.log?.(`Receiver started for account ${this.options.accountId}`);
+    this.options.log?.(
+      `Receiver started for account ${this.options.accountId}`,
+    );
 
     // 加载之前的同步缓冲
     await this.loadSyncBuffer();
 
+    this.emitSessionStatus(
+      saveSessionStatus(this.options.accountId, "connected", {
+        changedAt: this.now(),
+      }),
+    );
+
     // 开始轮询
-    await this.pollLoop();
+    void this.pollLoop();
   }
 
   /**
    * 停止接收消息
    */
   async stop(): Promise<void> {
-    if (!this.isRunning) return;
-
+    const wasRunning = this.isRunning;
     this.isRunning = false;
-    if (this.abortController) {
+
+    if (wasRunning && this.abortController) {
       this.abortController.abort();
-      this.abortController = null;
     }
+    this.abortController = null;
 
     // 保存同步缓冲
     await this.saveSyncBuffer();
-    this.options.log?.(`Receiver stopped for account ${this.options.accountId}`);
+    this.emitSessionStatus(
+      saveSessionStatus(this.options.accountId, "disconnected", {
+        changedAt: this.now(),
+      }),
+    );
+    this.options.log?.(
+      `Receiver stopped for account ${this.options.accountId}`,
+    );
   }
 
   /**
    * 轮询循环
    */
   private async pollLoop(): Promise<void> {
-    const timeoutMs = this.options.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
+    const timeoutMs =
+      this.options.longPollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
 
     while (this.isRunning && !this.abortController?.signal.aborted) {
       try {
@@ -125,6 +158,12 @@ export class MessageReceiver {
           (resp.errcode !== undefined && resp.errcode !== 0);
 
         if (isApiError) {
+          if (isSessionExpiredPayload({ errcode: resp.errcode, errmsg: resp.errmsg })) {
+            this.options.errorLog?.("getUpdates detected session expired");
+            this.handleSessionExpired(resp.errcode, resp.errmsg);
+            return;
+          }
+
           this.consecutiveFailures++;
           const errMsg = `getUpdates failed: ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg}`;
           this.options.errorLog?.(errMsg);
@@ -158,6 +197,17 @@ export class MessageReceiver {
           break;
         }
 
+        if (isSessionExpiredError(err)) {
+          this.options.errorLog?.(`getUpdates session expired: ${String(err)}`);
+          this.handleSessionExpired(
+            err instanceof Error && "apiErrorCode" in err && typeof err.apiErrorCode === "number"
+              ? err.apiErrorCode
+              : undefined,
+            err instanceof Error ? err.message : String(err),
+          );
+          return;
+        }
+
         this.consecutiveFailures++;
         const errMsg = `getUpdates error: ${String(err)}`;
         this.options.errorLog?.(errMsg);
@@ -179,10 +229,14 @@ export class MessageReceiver {
   private async processRawMessage(rawMsg: any): Promise<void> {
     const fromUserId = rawMsg.from_user_id ?? "";
     this.options.log?.(`Received message from ${fromUserId}`);
+    const receivedAt = this.now();
 
     // 保存 context token
     if (rawMsg.context_token) {
-      setContextToken(this.options.accountId, fromUserId, rawMsg.context_token);
+      setContextToken(this.options.accountId, fromUserId, rawMsg.context_token, {
+        receivedAt,
+        messageId: rawMsg.message_id !== undefined ? String(rawMsg.message_id) : undefined,
+      });
     }
 
     // 构建消息对象
@@ -212,14 +266,32 @@ export class MessageReceiver {
 
     // 下载媒体 (如果有)
     const mediaItem =
-      itemList.find((i: any) => i.type === MessageItemType.IMAGE && i.image_item?.media?.encrypt_query_param) ??
-      itemList.find((i: any) => i.type === MessageItemType.VIDEO && i.video_item?.media?.encrypt_query_param) ??
-      itemList.find((i: any) => i.type === MessageItemType.FILE && i.file_item?.media?.encrypt_query_param) ??
-      itemList.find((i: any) => i.type === MessageItemType.VOICE && i.voice_item?.media?.encrypt_query_param && !i.voice_item?.text);
+      itemList.find(
+        (i: any) =>
+          i.type === MessageItemType.IMAGE &&
+          i.image_item?.media?.encrypt_query_param,
+      ) ??
+      itemList.find(
+        (i: any) =>
+          i.type === MessageItemType.VIDEO &&
+          i.video_item?.media?.encrypt_query_param,
+      ) ??
+      itemList.find(
+        (i: any) =>
+          i.type === MessageItemType.FILE &&
+          i.file_item?.media?.encrypt_query_param,
+      ) ??
+      itemList.find(
+        (i: any) =>
+          i.type === MessageItemType.VOICE &&
+          i.voice_item?.media?.encrypt_query_param &&
+          !i.voice_item?.text,
+      );
 
     if (mediaItem) {
       try {
-        const mediaSaveDir = this.options.mediaSaveDir ?? `${this.options.stateDir}/media`;
+        const mediaSaveDir =
+          this.options.mediaSaveDir ?? `${this.options.stateDir}/media`;
         const downloadResult = await downloadMediaFromItem(mediaItem, {
           cdnBaseUrl: this.options.cdnBaseUrl,
           saveDir: mediaSaveDir,
@@ -228,10 +300,16 @@ export class MessageReceiver {
         });
 
         if (downloadResult.imagePath) {
-          message.image = { path: downloadResult.imagePath, mediaType: "image/*" };
+          message.image = {
+            path: downloadResult.imagePath,
+            mediaType: "image/*",
+          };
         }
         if (downloadResult.videoPath) {
-          message.video = { path: downloadResult.videoPath, mediaType: "video/mp4" };
+          message.video = {
+            path: downloadResult.videoPath,
+            mediaType: "video/mp4",
+          };
         }
         if (downloadResult.voicePath) {
           message.voice = {
@@ -242,7 +320,8 @@ export class MessageReceiver {
         if (downloadResult.filePath) {
           message.file = {
             path: downloadResult.filePath,
-            mediaType: downloadResult.fileMediaType ?? "application/octet-stream",
+            mediaType:
+              downloadResult.fileMediaType ?? "application/octet-stream",
             filename: downloadResult.filename,
           };
         }
@@ -274,21 +353,37 @@ export class MessageReceiver {
     }
   }
 
+  private emitSessionStatus(status: SessionStatus): void {
+    for (const handler of this.sessionStatusHandlers) {
+      try {
+        void handler(status);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  private handleSessionExpired(errorCode?: number, errorMessage?: string): void {
+    this.isRunning = false;
+    this.abortController = null;
+    this.emitSessionStatus(
+      saveSessionStatus(this.options.accountId, "session_expired", {
+        changedAt: this.now(),
+        errorCode,
+        errorMessage,
+      }),
+    );
+  }
+
   /**
    * 加载同步缓冲
    */
   private async loadSyncBuffer(): Promise<void> {
-    try {
-      const fs = await import("node:fs/promises");
-      const path = await import("node:path");
-      const filePath = path.join(this.options.stateDir, "sync-buf", `${this.options.accountId}.json`);
-      const data = await fs.readFile(filePath, "utf-8");
-      const parsed = JSON.parse(data);
-      this.getUpdatesBuf = parsed.getUpdatesBuf ?? "";
-      this.options.debugLog?.(`Loaded sync buffer: ${this.getUpdatesBuf.length} bytes`);
-    } catch {
-      this.getUpdatesBuf = "";
-    }
+    const filePath = getSyncBufFilePath(this.options.accountId);
+    this.getUpdatesBuf = loadGetUpdatesBuf(filePath) ?? "";
+    this.options.debugLog?.(
+      `Loaded sync buffer: ${this.getUpdatesBuf.length} bytes`,
+    );
   }
 
   /**
@@ -296,14 +391,13 @@ export class MessageReceiver {
    */
   private async saveSyncBuffer(): Promise<void> {
     try {
-      const fs = await import("node:fs/promises");
-      const path = await import("node:path");
-      const dir = path.join(this.options.stateDir, "sync-buf");
-      await fs.mkdir(dir, { recursive: true });
-      const filePath = path.join(dir, `${this.options.accountId}.json`);
-      await fs.writeFile(filePath, JSON.stringify({ getUpdatesBuf: this.getUpdatesBuf }), "utf-8");
+      saveGetUpdatesBuf(getSyncBufFilePath(this.options.accountId), this.getUpdatesBuf);
     } catch (err) {
       this.options.errorLog?.(`Failed to save sync buffer: ${String(err)}`);
     }
+  }
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
   }
 }
